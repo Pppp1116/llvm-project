@@ -3663,8 +3663,12 @@ LValue CodeGenFunction::EmitDeclRefLValue(const DeclRefExpr *E) {
 
   if (const auto *VD = dyn_cast<VarDecl>(ND)) {
     // Check if this is a global variable.
-    if (VD->hasLinkage() || VD->isStaticDataMember())
-      return EmitGlobalVarDeclLValue(*this, E, VD);
+    if (VD->hasLinkage() || VD->isStaticDataMember()) {
+      LValue LV = EmitGlobalVarDeclLValue(*this, E, VD);
+      if (getLangOpts().HLSL)
+        CGM.getHLSLRuntime().populateGlobalStructResources(*this, VD, LV);
+      return LV;
+    }
 
     Address addr = Address::invalid();
 

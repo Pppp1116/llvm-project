@@ -32,6 +32,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Frontend/HLSL/RootSignatureMetadata.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -115,6 +116,131 @@ static const ValueDecl *getArrayDecl(const ArraySubscriptExpr *ASE) {
   }
   return getArrayDecl(E);
 }
+
+static DeclRefExpr *createVarDeclRefExpr(ASTContext &AST, const VarDecl *VD,
+                                         SourceLocation Loc) {
+  return DeclRefExpr::Create(AST, NestedNameSpecifierLoc(), SourceLocation(),
+                             const_cast<VarDecl *>(VD),
+                             /*RefersToEnclosingVariableOrCapture=*/false, Loc,
+                             VD->getType(), VK_LValue);
+}
+
+static bool containsStructResources(QualType Ty) {
+  Ty = Ty.getCanonicalType();
+  const clang::Type *T = Ty.getTypePtr();
+  if (T->isHLSLResourceRecord() || T->isHLSLResourceRecordArray())
+    return true;
+
+  if (const auto *CAT = dyn_cast<ConstantArrayType>(T))
+    return containsStructResources(CAT->getElementType());
+
+  const auto *RD = Ty->getAsCXXRecordDecl();
+  if (!RD)
+    return false;
+
+  assert(RD->getNumBases() <= 1 && "HLSL doesn't support multiple inheritance");
+  if (auto Base = RD->bases_begin();
+      Base != RD->bases_end() && containsStructResources(Base->getType()))
+    return true;
+
+  return llvm::any_of(RD->fields(), [](const FieldDecl *FD) {
+    return containsStructResources(FD->getType());
+  });
+}
+
+class StructResourcePopulator {
+  CGHLSLRuntime &Runtime;
+  CodeGenFunction &CGF;
+  const VarDecl *RootDecl;
+  ArrayRef<const HLSLAssociatedResourceDeclAttr *> ResourceAttrs;
+  size_t ResourceIndex = 0;
+
+  ASTContext &getASTContext() const { return CGF.getContext(); }
+
+  SourceLocation getLoc() const { return RootDecl->getLocation(); }
+
+  const VarDecl *getNextResourceDecl() {
+    assert(ResourceIndex < ResourceAttrs.size() &&
+           "not enough associated resource declarations");
+    return ResourceAttrs[ResourceIndex++]->getResDecl();
+  }
+
+  LValue getArrayElementLValue(LValue Base, QualType ElementTy,
+                               uint64_t Index) {
+    Address ElemAddr = CGF.Builder.CreateConstArrayGEP(Base.getAddress(), Index);
+    return CGF.MakeAddrLValue(ElemAddr, ElementTy, Base.getBaseInfo(),
+                              CGF.CGM.getTBAAInfoForSubobject(Base, ElementTy));
+  }
+
+  LValue getDirectBaseLValue(LValue Base, const CXXRecordDecl *Derived,
+                             const CXXBaseSpecifier &BaseSpec) {
+    QualType BaseTy = BaseSpec.getType();
+    const auto *BaseDecl = BaseTy->getAsCXXRecordDecl();
+    Address BaseAddr = CGF.GetAddressOfDirectBaseInCompleteClass(
+        Base.getAddress(), Derived, BaseDecl, BaseSpec.isVirtual());
+    return CGF.MakeAddrLValue(BaseAddr, BaseTy, Base.getBaseInfo(),
+                              CGF.CGM.getTBAAInfoForSubobject(Base, BaseTy));
+  }
+
+  void populateResource(LValue Dest, QualType ResourceTy) {
+    const VarDecl *ResDecl = getNextResourceDecl();
+    if (ResourceTy->isHLSLResourceRecordArray()) {
+      Expr *ResRef = createVarDeclRefExpr(getASTContext(), ResDecl, getLoc());
+      bool Emitted = Runtime.emitResourceArrayCopy(Dest, ResRef, CGF);
+      assert(Emitted && "expected global associated resource array");
+      (void)Emitted;
+      return;
+    }
+
+    LValue Src =
+        CGF.EmitDeclRefLValue(createVarDeclRefExpr(getASTContext(), ResDecl,
+                                                   getLoc()));
+    CGF.EmitAggregateAssign(Dest, Src, ResourceTy);
+  }
+
+public:
+  StructResourcePopulator(
+      CGHLSLRuntime &Runtime, CodeGenFunction &CGF, const VarDecl *RootDecl,
+      ArrayRef<const HLSLAssociatedResourceDeclAttr *> ResourceAttrs)
+      : Runtime(Runtime), CGF(CGF), RootDecl(RootDecl),
+        ResourceAttrs(ResourceAttrs) {}
+
+  void populate(LValue Base, QualType Ty) {
+    Ty = Ty.getCanonicalType();
+    const clang::Type *T = Ty.getTypePtr();
+    if (T->isHLSLResourceRecord() || T->isHLSLResourceRecordArray()) {
+      populateResource(Base, Ty);
+      return;
+    }
+
+    if (const auto *CAT = dyn_cast<ConstantArrayType>(T)) {
+      QualType ElementTy = CAT->getElementType();
+      if (!containsStructResources(ElementTy))
+        return;
+
+      for (uint64_t I = 0, E = CAT->getSize().getZExtValue(); I < E; ++I)
+        populate(getArrayElementLValue(Base, ElementTy, I), ElementTy);
+      return;
+    }
+
+    const auto *RD = Ty->getAsCXXRecordDecl();
+    if (!RD)
+      return;
+
+    assert(RD->getNumBases() <= 1 && "HLSL doesn't support multiple inheritance");
+    const auto *BaseIt = RD->bases_begin();
+    if (BaseIt != RD->bases_end() && containsStructResources(BaseIt->getType()))
+      populate(getDirectBaseLValue(Base, RD, *BaseIt), BaseIt->getType());
+
+    for (const FieldDecl *FD : RD->fields()) {
+      if (!containsStructResources(FD->getType()))
+        continue;
+      populate(CGF.EmitLValueForField(Base, FD), FD->getType());
+    }
+  }
+
+  bool finished() const { return ResourceIndex == ResourceAttrs.size(); }
+};
 
 // Get the total size of the array, or 0 if the array is unbounded.
 static int getTotalArraySize(ASTContext &AST, const clang::Type *Ty) {
@@ -1366,6 +1492,21 @@ bool CGHLSLRuntime::emitResourceArrayCopy(LValue &LHS, Expr *RHSExpr,
       CGF, ResTy->getAsCXXRecordDecl(), ResArrayTy, ValueSlot, Range, Zero,
       ArrayDecl->getName(), Binding, {Zero}, RHSExpr->getExprLoc());
   return EndIndex.has_value();
+}
+
+void CGHLSLRuntime::populateGlobalStructResources(CodeGenFunction &CGF,
+                                                  const VarDecl *VD,
+                                                  LValue Root) {
+  llvm::SmallVector<const HLSLAssociatedResourceDeclAttr *, 8> ResourceAttrs;
+  for (const auto *Attr : VD->specific_attrs<HLSLAssociatedResourceDeclAttr>())
+    ResourceAttrs.push_back(Attr);
+  if (ResourceAttrs.empty())
+    return;
+
+  StructResourcePopulator Populator(*this, CGF, VD, ResourceAttrs);
+  Populator.populate(Root, VD->getType());
+  assert(Populator.finished() &&
+         "expected all associated resource declarations to be consumed");
 }
 
 RawAddress CGHLSLRuntime::createBufferMatrixTempAddress(const LValue &LV,
