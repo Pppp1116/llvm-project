@@ -1141,6 +1141,97 @@ static bool ProcessFormatStringLiteral(const Expr *FormatExpr,
   return false;
 }
 
+static StringRef getSimpleLibraryFunctionName(const FunctionDecl *FD) {
+  if (!FD)
+    return {};
+  IdentifierInfo *II = FD->getIdentifier();
+  if (!II)
+    return {};
+
+  StringRef Name = II->getName();
+  Name.consume_front("__builtin_");
+  return Name;
+}
+
+static const Expr *getDirectStrlenCallArgument(const Expr *E) {
+  const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenCasts());
+  if (!CE || CE->getNumArgs() != 1)
+    return nullptr;
+
+  if (getSimpleLibraryFunctionName(CE->getDirectCallee()) != "strlen")
+    return nullptr;
+  return CE->getArg(0)->IgnoreParenCasts();
+}
+
+static bool areSameSimpleDeclRef(const Expr *E1, const Expr *E2) {
+  const auto *D1 = dyn_cast<DeclRefExpr>(E1->IgnoreParenCasts());
+  const auto *D2 = dyn_cast<DeclRefExpr>(E2->IgnoreParenCasts());
+  return D1 && D2 && D1->getDecl() == D2->getDecl();
+}
+
+static std::string getExprAsString(const Expr *E, const PrintingPolicy &Policy) {
+  SmallString<64> Text;
+  llvm::raw_svector_ostream OS(Text);
+  E->printPretty(OS, nullptr, Policy);
+  return std::string(OS.str());
+}
+
+static FixItHint getPlusOneFixIt(const Expr *E, const PrintingPolicy &Policy) {
+  const Expr *SimpleExpr = E->IgnoreParenCasts();
+  if (!isa<DeclRefExpr, CallExpr>(SimpleExpr))
+    return {};
+
+  SourceRange Range = E->getSourceRange();
+  if (Range.getBegin().isMacroID() || Range.getEnd().isMacroID())
+    return {};
+
+  SmallString<64> Replacement;
+  llvm::raw_svector_ostream OS(Replacement);
+  E->printPretty(OS, nullptr, Policy);
+  OS << " + 1";
+  return FixItHint::CreateReplacement(Range, OS.str());
+}
+
+static void DiagnoseMissingNullTerminatorSpace(Sema &S, SourceLocation Loc,
+                                               const Expr *SizeExpr,
+                                               unsigned MissingKind) {
+  std::string SizeText = getExprAsString(SizeExpr, S.getPrintingPolicy());
+  S.Diag(Loc, diag::warn_fortify_missing_null_terminator_space)
+      << MissingKind << SizeText
+      << getPlusOneFixIt(SizeExpr, S.getPrintingPolicy());
+}
+
+static void CheckCStringNullTerminatorSizeArguments(Sema &S,
+                                                    const FunctionDecl *FD,
+                                                    const CallExpr *TheCall) {
+  if (TheCall->isValueDependent() || TheCall->isTypeDependent() ||
+      S.isConstantEvaluatedContext() ||
+      S.Diags.isIgnored(diag::warn_fortify_missing_null_terminator_space,
+                        TheCall->getBeginLoc()))
+    return;
+
+  StringRef Name = getSimpleLibraryFunctionName(FD);
+  if (Name == "malloc") {
+    if (TheCall->getNumArgs() != 1)
+      return;
+    const Expr *SizeArg = TheCall->getArg(0)->IgnoreParenCasts();
+    if (getDirectStrlenCallArgument(SizeArg))
+      DiagnoseMissingNullTerminatorSpace(S, TheCall->getBeginLoc(), SizeArg,
+                                         /*MissingKind=*/0);
+    return;
+  }
+
+  if (Name != "memcpy" || TheCall->getNumArgs() != 3)
+    return;
+
+  const Expr *SrcArg = TheCall->getArg(1)->IgnoreParenCasts();
+  const Expr *SizeArg = TheCall->getArg(2)->IgnoreParenCasts();
+  const Expr *StrlenArg = getDirectStrlenCallArgument(SizeArg);
+  if (StrlenArg && areSameSimpleDeclRef(StrlenArg, SrcArg))
+    DiagnoseMissingNullTerminatorSpace(S, TheCall->getBeginLoc(), SizeArg,
+                                       /*MissingKind=*/1);
+}
+
 void Sema::checkFortifiedBuiltinMemoryFunction(FunctionDecl *FD,
                                                CallExpr *TheCall) {
   if (TheCall->isValueDependent() || TheCall->isTypeDependent() ||
@@ -1247,6 +1338,7 @@ void Sema::checkFortifiedBuiltinMemoryFunction(FunctionDecl *FD,
   std::optional<llvm::APSInt> DestinationSize;
   unsigned DiagID = 0;
   bool IsChkVariant = false;
+  bool UseLiteralCopyOverflowDiag = false;
 
   auto GetFunctionName = [&]() {
     std::string FunctionNameStr =
@@ -1276,6 +1368,10 @@ void Sema::checkFortifiedBuiltinMemoryFunction(FunctionDecl *FD,
     DiagID = diag::warn_fortify_strlen_overflow;
     SourceSize = ComputeStrLenArgument(1);
     DestinationSize = ComputeSizeArgument(0);
+    UseLiteralCopyOverflowDiag =
+        (BuiltinID == Builtin::BI__builtin_strcpy ||
+         BuiltinID == Builtin::BIstrcpy) &&
+        isa<StringLiteral>(TheCall->getArg(1)->IgnoreParenCasts());
     break;
   }
 
@@ -1286,6 +1382,9 @@ void Sema::checkFortifiedBuiltinMemoryFunction(FunctionDecl *FD,
     SourceSize = ComputeStrLenArgument(1);
     DestinationSize = ComputeExplicitObjectSizeArgument(2);
     IsChkVariant = true;
+    UseLiteralCopyOverflowDiag =
+        BuiltinID == Builtin::BI__builtin___strcpy_chk &&
+        isa<StringLiteral>(TheCall->getArg(1)->IgnoreParenCasts());
     break;
   }
 
@@ -1470,6 +1569,14 @@ void Sema::checkFortifiedBuiltinMemoryFunction(FunctionDecl *FD,
   SmallString<16> SourceStr;
   DestinationSize->toString(DestinationStr, /*Radix=*/10);
   SourceSize->toString(SourceStr, /*Radix=*/10);
+
+  if (UseLiteralCopyOverflowDiag) {
+    DiagRuntimeBehavior(TheCall->getBeginLoc(), TheCall,
+                        PDiag(diag::warn_fortify_literal_copy_too_large)
+                            << SourceStr << DestinationStr);
+    return;
+  }
+
   DiagRuntimeBehavior(TheCall->getBeginLoc(), TheCall,
                       PDiag(DiagID)
                           << FunctionName << DestinationStr << SourceStr);
@@ -4449,6 +4556,7 @@ bool Sema::CheckFunctionCall(FunctionDecl *FDecl, CallExpr *TheCall,
   CheckAbsoluteValueFunction(TheCall, FDecl);
   CheckMaxUnsignedZero(TheCall, FDecl);
   CheckInfNaNFunction(TheCall, FDecl);
+  CheckCStringNullTerminatorSizeArguments(*this, FDecl, TheCall);
 
   if (getLangOpts().ObjC)
     ObjC().DiagnoseCStringFormatDirectiveInCFAPI(FDecl, Args, NumArgs);
